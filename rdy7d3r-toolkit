@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# RDY7D3R single-file system and SSH monitoring toolkit.
+# Read-only checks: this script does not block IPs, alter firewall rules, or install packages.
+set -o pipefail
+
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+  R=$(tput sgr0); G=$(tput setaf 2); Y=$(tput setaf 3); C=$(tput setaf 6); B=$(tput bold)
+else R=""; G=""; Y=""; C=""; B=""; fi
+SUDO=(); [[ $EUID -eq 0 ]] || SUDO=(sudo)
+
+pause(){ echo; read -r -p "Press Enter to return to menu..." _; }
+header(){
+  clear 2>/dev/null || true
+  printf '%s\n' "${C}${B}"
+  cat <<'EOF'
+╔══════════════════════════════════════════════════════════════╗
+║                    RDY7D3R TOOLKIT                          ║
+║              SYSTEM + SSH HEALTH CHECK                      ║
+║                  Developer: Rdy7d3r                         ║
+╚══════════════════════════════════════════════════════════════╝
+EOF
+  printf '%s\n' "$R"
+  echo "Host: $(hostname)   User: $(id -un)   Date: $(date)"
+}
+section(){ printf '\n%s\n' "${C}--- $1 ---${R}"; }
+
+cpu_check(){
+  section "CPU AND LOAD"
+  command -v lscpu >/dev/null && lscpu | grep -E 'Architecture|Model name|CPU\\(s\\)|Thread|Core|Socket' | head -n 8
+  uptime
+  ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -n 11
+}
+ram_check(){
+  section "RAM AND SWAP"
+  free -h
+  grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+  ps -eo pid,comm,%mem,%cpu --sort=-%mem | head -n 11
+}
+disk_check(){
+  section "DISK AND STORAGE"
+  df -hT
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS 2>/dev/null || lsblk
+  if command -v smartctl >/dev/null 2>&1; then
+    echo "SMART device scan:"
+    "${SUDO[@]}" smartctl --scan 2>/dev/null || true
+  else echo "smartctl unavailable; SMART scan skipped."; fi
+}
+temp_check(){
+  section "HARDWARE TEMPERATURE"
+  if command -v sensors >/dev/null 2>&1; then sensors
+  else echo "sensors command unavailable (lm-sensors not installed)."; fi
+}
+network_check(){
+  section "NETWORK"
+  if command -v ip >/dev/null 2>&1; then
+    ip -brief address
+    echo; ip route
+    echo; ip -s link
+  else echo "ip command unavailable."; fi
+  if command -v ss >/dev/null 2>&1; then echo; ss -s; echo; ss -lnt; fi
+}
+process_check(){
+  section "PROCESSES"
+  ps aux --sort=-%cpu | head -n 16
+  echo "Process count: $(ps -e --no-headers | wc -l)"
+  section "SYSTEMD SERVICES"
+  if command -v systemctl >/dev/null 2>&1; then
+    "${SUDO[@]}" systemctl --failed --no-pager 2>/dev/null || true
+    echo
+    "${SUDO[@]}" systemctl list-units --type=service --state=running --no-pager 2>/dev/null | head -n 30
+  else echo "systemctl unavailable."; fi
+}
+ssh_check(){
+  section "SSH SERVICE AND CONNECTIONS"
+  local service=""
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet ssh 2>/dev/null; then service=ssh
+    elif systemctl is-active --quiet sshd 2>/dev/null; then service=sshd; fi
+  fi
+  if [[ -n "$service" ]]; then echo "${G}SSH service running: $service${R}"
+  else echo "${Y}SSH service not detected as running.${R}"; fi
+  echo; echo "SSH port 22 listeners:"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntp 2>/dev/null | grep -E '(:22[[:space:]]|:22$)' || echo "No port 22 listener found."
+    echo; echo "Established connections involving port 22:"
+    ss -tnp 2>/dev/null | awk 'NR==1 || ($1=="ESTAB" && ($4 ~ /:22$/ || $5 ~ /:22$/))'
+  fi
+  echo; echo "Successful SSH logins (recent):"
+  if [[ -n "$service" ]] && command -v journalctl >/dev/null 2>&1; then
+    "${SUDO[@]}" journalctl -u "$service" --since "24 hours ago" --no-pager 2>/dev/null |
+      grep -E 'Accepted (password|publickey|keyboard-interactive)' | tail -n 20 || echo "No events found."
+  elif [[ -r /var/log/auth.log ]]; then
+    grep -E 'Accepted (password|publickey|keyboard-interactive)' /var/log/auth.log | tail -n 20 || echo "No events found."
+  else echo "Authentication log unavailable."; fi
+  echo; echo "Failed SSH logins (recent):"
+  if [[ -n "$service" ]] && command -v journalctl >/dev/null 2>&1; then
+    "${SUDO[@]}" journalctl -u "$service" --since "24 hours ago" --no-pager 2>/dev/null |
+      grep -Ei 'Failed password|Invalid user|authentication failure' | tail -n 20 || echo "No events found."
+  elif [[ -r /var/log/auth.log ]]; then
+    grep -Ei 'Failed password|Invalid user|authentication failure' /var/log/auth.log | tail -n 20 || echo "No events found."
+  else echo "Authentication log unavailable."; fi
+  echo; echo "Logged-in users:"; who -a 2>/dev/null || true
+  echo; echo "authorized_keys locations:"
+  find /home /root -type f -name authorized_keys -print 2>/dev/null || true
+  echo; echo "UFW status (read-only):"
+  if command -v ufw >/dev/null 2>&1; then "${SUDO[@]}" ufw status verbose 2>/dev/null || true
+  else echo "UFW not installed."; fi
+}
+all_checks(){
+  header
+  cpu_check; ram_check; disk_check; temp_check; network_check; process_check; ssh_check
+  section "ALL CHECKS COMPLETE"
+}
+main_menu(){
+  while true; do
+    header
+    echo "${G}[1]${R} CPU check"
+    echo "${G}[2]${R} RAM / Memory check"
+    echo "${G}[3]${R} Disk / SMART check"
+    echo "${G}[4]${R} Temperature check"
+    echo "${G}[5]${R} Network check"
+    echo "${G}[6]${R} Process / Service check"
+    echo "${G}[7]${R} SSH security check"
+    echo "${Y}[A]${R} Run all checks"
+    echo "[0] Exit"
+    echo
+    read -r -p "Rdy7d3r=menu-)(=> " choice
+    case "$choice" in
+      1) header; cpu_check; pause ;;
+      2) header; ram_check; pause ;;
+      3) header; disk_check; pause ;;
+      4) header; temp_check; pause ;;
+      5) header; network_check; pause ;;
+      6) header; process_check; pause ;;
+      7) header; ssh_check; pause ;;
+      [Aa]) all_checks; pause ;;
+      0) echo "Exiting RDY7D3R Toolkit."; break ;;
+      *) echo "Invalid option."; sleep 1 ;;
+    esac
+  done
+}
+main_menu
